@@ -1,0 +1,197 @@
+---
+title: "Heart Failure Mortality Prediction"
+author: "Abdullah Naushab"
+output: html_document
+---
+
+## 1. Data
+
+```{r}
+library(tidyverse)
+library(caret)
+library(GGally)
+library(factoextra)
+library(pROC)
+
+df <- read.csv("heart_failure_clinical_records_dataset.csv", header = TRUE)
+
+head(df)
+summary(df)
+nrow(df)
+names(df)
+```
+
+The dataset is the Heart Failure Clinical Records dataset from Kaggle. It contains 299 patients with 13 variables, including age, anaemia, diabetes, ejection fraction, serum creatinine, and whether the patient died (DEATH_EVENT). It has both numerical and categorical variables, which makes it a good fit for a full data mining pipeline.
+
+## 2. Exploratory Analysis
+
+```{r}
+hist(df$age, nclass = 10)
+hist(df$creatinine_phosphokinase, nclass = 10)
+hist(df$ejection_fraction, nclass = 10)
+hist(df$serum_creatinine, nclass = 10)
+hist(df$serum_sodium, nclass = 10)
+hist(df$time, nclass = 10)
+
+boxplot(df[, c("age", "ejection_fraction", "serum_creatinine", "serum_sodium", "time")])
+
+ggplot(df, aes(x = as.factor(DEATH_EVENT))) + geom_bar() + xlab("Death Event (0=No, 1=Yes)")
+ggplot(df, aes(x = as.factor(anaemia))) + geom_bar() + xlab("Anaemia")
+ggplot(df, aes(x = as.factor(diabetes))) + geom_bar() + xlab("Diabetes")
+ggplot(df, aes(x = as.factor(sex))) + geom_bar() + xlab("Sex")
+
+df %>% select(age, creatinine_phosphokinase, ejection_fraction, platelets,
+              serum_creatinine, serum_sodium, time) %>% cor() %>% round(2)
+
+ggplot(df, aes(x = age, y = ejection_fraction, color = as.factor(DEATH_EVENT))) +
+  geom_point(alpha = 0.6) + xlab("Age") + ylab("Ejection Fraction") + labs(color = "Death Event")
+
+ggplot(df, aes(x = as.factor(DEATH_EVENT), y = serum_creatinine)) +
+  geom_boxplot() + xlab("Death Event") + ylab("Serum Creatinine")
+```
+
+Age is fairly normally distributed around 60, while creatinine_phosphokinase and serum_creatinine are heavily right skewed with some very large values. The dataset has more survivors than deaths and more males than females. Most variables are only weakly correlated with each other. Patients who died tend to have lower ejection fraction and higher serum creatinine.
+
+## 3. Data Cleaning
+
+```{r}
+sum(is.na(df))
+colSums(is.na(df))
+
+boxplot(df[, c("age", "creatinine_phosphokinase", "ejection_fraction",
+               "platelets", "serum_creatinine", "serum_sodium", "time")])
+```
+
+There are no missing values, so no rows need to be dropped. The boxplot shows outliers in creatinine_phosphokinase and platelets, but these are clinically possible values for heart failure patients, so they are kept. There are no impossible values like negative ages.
+
+```{r}
+df$anaemia             <- as.factor(df$anaemia)
+df$diabetes            <- as.factor(df$diabetes)
+df$high_blood_pressure <- as.factor(df$high_blood_pressure)
+df$sex                 <- as.factor(df$sex)
+df$smoking             <- as.factor(df$smoking)
+df$DEATH_EVENT         <- as.factor(df$DEATH_EVENT)
+
+summary(df)
+```
+
+## 4. Preprocessing
+
+```{r}
+num_cols <- c("age", "creatinine_phosphokinase", "ejection_fraction",
+              "platelets", "serum_creatinine", "serum_sodium", "time")
+
+preproc <- preProcess(df[, num_cols], method = c("center", "scale"))
+df_scaled <- df
+df_scaled[, num_cols] <- predict(preproc, df[, num_cols])
+
+summary(df_scaled[, num_cols])
+```
+
+Scaling is needed because kNN relies on distances. Without it, large-valued variables like creatinine_phosphokinase would dominate the distance calculation. All 7 numerical variables were standardized (mean 0, standard deviation 1).
+
+## 5. Clustering (K-Means)
+
+```{r}
+cluster_data <- df_scaled %>% select(-DEATH_EVENT)
+
+dummy <- dummyVars(~ ., data = cluster_data)
+cluster_dummies <- as.data.frame(predict(dummy, newdata = cluster_data))
+
+fviz_nbclust(cluster_dummies, kmeans, method = "wss")
+fviz_nbclust(cluster_dummies, kmeans, method = "silhouette")
+```
+
+```{r}
+set.seed(123)
+fit <- kmeans(cluster_dummies, centers = 2, nstart = 25)
+fit
+
+pca <- prcomp(cluster_dummies)
+rotated_data <- as.data.frame(pca$x)
+rotated_data$Clusters <- as.factor(fit$cluster)
+rotated_data$DEATH_EVENT <- df$DEATH_EVENT
+
+ggplot(rotated_data, aes(x = PC1, y = PC2, col = Clusters)) +
+  geom_point(alpha = 0.5) + ggtitle("K-Means Clusters")
+
+ggplot(rotated_data, aes(x = PC1, y = PC2, col = DEATH_EVENT)) +
+  geom_point(alpha = 0.5) + ggtitle("True Death Event Labels")
+
+table(Cluster = fit$cluster, DEATH_EVENT = df$DEATH_EVENT)
+```
+
+The elbow plot flattens around k = 2, and the silhouette plot is not decisive, so k = 2 was used. Cluster 1 has 43 survivors and 69 deaths, while cluster 2 has 160 survivors and 27 deaths. The clusters partially line up with the death outcome, but the PCA plot shows a lot of overlap.
+
+## 6. Classification: Decision Tree vs. kNN
+
+```{r}
+set.seed(123)
+
+index <- createDataPartition(y = df_scaled$DEATH_EVENT, p = 0.7, list = FALSE)
+train_set <- df_scaled[index, ]
+test_set  <- df_scaled[-index, ]
+
+train_control <- trainControl(method = "cv", number = 10)
+
+tree_fit <- train(DEATH_EVENT ~ ., data = train_set, method = "rpart",
+                  trControl = train_control)
+tree_fit
+
+knn_fit <- train(DEATH_EVENT ~ ., data = train_set, method = "knn",
+                 trControl = train_control,
+                 preProcess = c("center", "scale"),
+                 tuneLength = 10)
+knn_fit
+
+pred_tree <- predict(tree_fit, test_set)
+pred_knn  <- predict(knn_fit,  test_set)
+
+# confusionMatrix(predictions, actual); positive class = death
+confusionMatrix(pred_tree, test_set$DEATH_EVENT, positive = "1")
+confusionMatrix(pred_knn,  test_set$DEATH_EVENT, positive = "1")
+```
+
+The data was split 70/30 into train and test sets, with 10-fold cross-validation on the training set to tune each model.
+
+| Model | Best setting | Cross-validated accuracy | Test accuracy |
+|---|---|---|---|
+| Decision tree | cp = 0.07 | 82.0% | 75.0% |
+| kNN | k = 7 | 77.7% | 69.3% |
+
+The decision tree performed better on both, so it was used for the evaluation below.
+
+## 7. Evaluating the Decision Tree
+
+```{r}
+cm <- confusionMatrix(pred_tree, test_set$DEATH_EVENT, positive = "1")
+cm
+
+# rows = predicted, columns = actual
+TP <- cm$table["1", "1"]
+FP <- cm$table["1", "0"]
+FN <- cm$table["0", "1"]
+TN <- cm$table["0", "0"]
+
+precision <- TP / (TP + FP)
+recall    <- TP / (TP + FN)
+
+cat("Precision:", precision, "\n")
+cat("Recall:", recall, "\n")
+
+pred_prob <- predict(tree_fit, test_set, type = "prob")
+roc_obj <- roc(test_set$DEATH_EVENT, pred_prob[, "1"])
+plot(roc_obj, print.auc = TRUE)
+```
+
+On the test set, the model correctly predicted 43 survivors and 23 deaths, but it classified 17 survivors as deaths and 5 deaths as survivors.
+
+- **Precision = 0.575:** when the model predicts death, it's right 57.5% of the time.
+- **Recall = 0.821:** the model catches 82% of actual deaths.
+- **Accuracy = 75%**, **AUC = 0.838**
+
+The AUC shows the model separates survivors from deaths well across thresholds. Recall matters more than precision here, since missing a real death is more dangerous than a false alarm.
+
+## 8. Conclusion
+
+The goal was to predict death events in heart failure patients. Exploration showed that serum creatinine and ejection fraction were the clearest warning signs: patients who died had higher serum creatinine and lower ejection fraction on average. Clustering found some separation between survivors and deaths, but with a lot of overlap. The decision tree beat kNN, reaching 75% test accuracy, an AUC of 0.838, and a recall of 0.821. High recall is especially important in a medical setting, where catching real deaths matters more than avoiding false alarms.
